@@ -1,0 +1,48 @@
+image: docker:19.03.1
+
+stages:
+  - build
+  - tests
+  - deploy
+
+variables:
+  DOCKER_TLS_CERTDIR: "/certs"
+
+services:
+  - docker:19.03.1-dind
+
+before_script:
+  - 'which ssh-agent || ( apt-get update -y && apt-get install openssh-client -y )'
+  - eval $(ssh-agent -s)
+  - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
+  - mkdir -p ~/.ssh
+  - chmod 700 ~/.ssh
+  - export IMAGE_REPOSITORY=registry.example.com/"${CI_PROJECT_NAMESPACE}"
+  - export IMAGE_NAME=${CI_PROJECT_NAME}-$(gen-short-string ${CI_COMMIT_REF_SLUG})
+  - export TAG_NAME=${CI_PIPELINE_ID}
+  - docker login -u "$REGISTRY_USER" -p "$REGISTRY_PASSWORD" "$REGISTRY"
+
+build:
+  stage: build
+  script:
+    - export DOCKER_BUILDKIT=1 && docker build --ssh default="${SSH_AUTH_SOCK}" --build-arg COMPOSER_NO_DEV="--no-dev" --pull --label "branch=${CI_COMMIT_REF_NAME}" --tag "${IMAGE_REPOSITORY}/${IMAGE_NAME}:${TAG_NAME}" -f ./build/Dockerfile .
+    - docker tag "${IMAGE_REPOSITORY}"/"${IMAGE_NAME}":"${TAG_NAME}" "${IMAGE_REPOSITORY}"/"${IMAGE_NAME}":latest
+    - docker push "${IMAGE_REPOSITORY}"/"${IMAGE_NAME}":"${TAG_NAME}"
+    - docker push "${IMAGE_REPOSITORY}"/"${IMAGE_NAME}":latest
+  only:
+    - release
+
+tests:
+  stage: tests
+  script:
+    - docker run --rm "${IMAGE_REPOSITORY}"/"${IMAGE_NAME}":"${TAG_NAME}" /web/tests/checkers.sh
+
+deploy:
+  stage: deploy
+  script:
+    - mkdir -p .kube
+    - echo ${kube_config} | base64 -d > .kube/config
+    - echo "${ENVIRONMENTS_YAML}" > deploy/app_name/environments.yaml
+    - docker run --rm -v $(pwd):/apps -v $(pwd)/.kube:/root/.kube -v $(pwd)/.helm:/root/.helm alpine/helm  upgrade --install --namespace app-prod app-prod deploy/app_name --values deploy/app_name/environments.yaml --set image.repository="${IMAGE_REPOSITORY}"/"${IMAGE_NAME}" --set image.tag="${TAG_NAME}"
+  only:
+    - release
